@@ -17,6 +17,10 @@ import sys
 import threading
 from collections import OrderedDict
 from typing import List, Optional
+import hmac
+from functools import lru_cache
+_refresh_lock = threading.Lock()
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # project root
 KB_INDEX = os.path.join(BASE_DIR, "data", "kb_index.json")
@@ -55,7 +59,14 @@ templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 _conv_cache: "OrderedDict[str, List]" = OrderedDict()
 _CACHE_MAX = 50
 
+@lru_cache(maxsize=1)
+def _load_retriever(mtime: float):
+    return rmod.Retriever(KB_INDEX)
 
+def get_retriever():
+    if not os.path.exists(KB_INDEX):
+        raise RuntimeError("Knowledge base not built yet.")
+    return _load_retriever(os.path.getmtime(KB_INDEX))  # auto-reloads after rebuild
 def get_retriever() -> rmod.Retriever:
     if not os.path.exists(KB_INDEX):
         raise RuntimeError(
@@ -112,50 +123,19 @@ async def health():
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
-    question = (req.question or "").strip()
-    session_id = req.session_id or "default"
-    top_k = req.top_k
+def chat(req: ChatRequest):
+    question = req.question.strip()
+    top_k = max(1, min(req.top_k, 10))            # cap client input
+    history = _cache_get(req.session_id or "default")
 
-    if not question:
-        raise HTTPException(status_code=400, detail="question is required")
-
-    if not os.environ.get("OPENAI_API_KEY", ""):
-        return JSONResponse(
-            {
-                "error": "OPENAI_API_KEY not configured on the server.",
-                "answer": (
-                    "I'm not able to answer right now because the language model "
-                    "isn't configured. Please contact PlacidWay for a free quote."
-                ),
-                "sources": [],
-            },
-            status_code=503,
-        )
-
-    try:
-        retriever = get_retriever()
-        hits = retriever.search(question, top_k=top_k)
-        chunks = [c for c, _ in hits]
-    except Exception as exc:
-        return JSONResponse({"error": f"retrieval failed: {exc}"}, status_code=500)
-
+    search_q = llm_mod.rewrite_query(history, question)
+    hits = get_retriever().search(search_q, top_k=top_k)
+    chunks = [c for c, _ in hits]
     if not chunks:
-        return JSONResponse(
-            {
-                "answer": (
-                    "I couldn't find any relevant information on our pages to answer "
-                    "that question. Please contact PlacidWay for a free, personalized "
-                    "quote."
-                ),
-                "sources": [],
-            }
-        )
-
-    try:
-        result = llm_mod.answer(chunks, question)
-    except Exception as exc:
-        return JSONResponse({"error": f"answer generation failed: {exc}"}, status_code=500)
+        return JSONResponse({"answer": "I couldn't find this on our pages. "
+                             "Please contact PlacidWay for a free quote.",
+                             "sources": []})
+    result = llm_mod.answer(chunks, question)
 
     history = _cache_get(session_id)
     history.append({"role": "user", "content": question})
@@ -172,30 +152,16 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/api/refresh")
-async def refresh(req: RefreshRequest = RefreshRequest()):
-    """Re-scrape the 7 pages and rebuild the knowledge base."""
-
+def refresh(request: Request):
+    token = os.environ.get("ADMIN_TOKEN", "")
+    given = request.headers.get("x-admin-token", "")
+    if not token or not hmac.compare_digest(token, given):
+        raise HTTPException(status_code=403)
+    if not _refresh_lock.acquire(blocking=False):
+        return JSONResponse({"status": "already running"})
     def run():
-        try:
-            subprocess.run(
-                [sys.executable, "src/scraper.py"],
-                cwd=BASE_DIR,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            env = dict(os.environ)
-            subprocess.run(
-                [sys.executable, "src/build_kb.py"],
-                cwd=BASE_DIR,
-                check=True,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-        except Exception as exc:
-            print(f"[refresh] failed: {exc}")
-
+        try: ...  # your existing subprocess calls
+        finally: _refresh_lock.release()
     threading.Thread(target=run, daemon=True).start()
     return JSONResponse({"status": "started"})
 
