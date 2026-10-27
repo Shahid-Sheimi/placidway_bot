@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
+  <title>PlacidWay Assistant</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="logo">
+        <span class="logo-mark" aria-hidden="true">PW</span>
+        <div>
+          <h1>PlacidWay Assistant</h1>
+          <p class="subtitle">Answers based only on our official pages</p>
+        </div>
+      </div>
+      <button id="refreshBtn" class="btn" title="Re-scrape pages and rebuild knowledge base">
+        Refresh
+      </button>
+    </header>
+
+    <main class="chat">
+      <div id="messages" class="messages" aria-live="polite">
+        <div class="msg bot">
+          <p>Hi! I'm the PlacidWay assistant. I can answer questions about our treatments, costs, and clinics in Tijuana, using only information from our official pages.</p>
+          <p class="hint">Try: <em>How much does alternative cancer treatment cost at ITC in Tijuana?</em></p>
+        </div>
+      </div>
+
+      <form id="chatForm" class="composer">
+        <input
+          id="question"
+          type="text"
+          placeholder="Ask about treatments, costs, or clinics…"
+          aria-label="Your question"
+          autocomplete="off"
+          required
+        />
+        <button type="submit" class="btn primary" aria-label="Send">
+          <span>Send</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
+      </form>
+    </main>
+
+    <footer class="footer">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Ready.</span>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
