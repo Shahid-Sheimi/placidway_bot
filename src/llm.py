@@ -37,7 +37,8 @@ SYSTEM_PROMPT = """You are a careful, honest assistant for PlacidWay Medical Tou
 
 STRICT RULES:
 1. Answer the user's question using ONLY the facts in the retrieved passages below.
-2. Every factual claim must be traceable to a passage. Cite the source URL(s) in parentheses.
+2. Every factual claim must end with a citation marker like [1] or [2][3],
+   matching the passage numbers. Do NOT write URLs yourself.
 3. If the retrieved passages do NOT contain enough information to answer, say so clearly and
    suggest contacting PlacidWay for a free, personalized quote. Never invent prices,
    clinics, treatments, locations, or medical facts.
@@ -78,45 +79,37 @@ def build_messages(chunks: List[Dict], question: str) -> List[Dict[str, str]]:
     ]
 
 
-def answer(chunks: List[Dict], question: str) -> Dict[str, Any]:
-    """Generate a grounded answer. Returns {answer, sources, used_chunks}."""
-    if not API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    messages = build_messages(chunks, question)
-    resp = requests.post(
-        OPENAI_API_URL,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": CHAT_MODEL,
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": 700,
-        },
-        timeout=120,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+def answer(chunks, question):
+    ...
     text = data["choices"][0]["message"]["content"]
 
-    # collect unique source URLs actually used (from chunks we fed)
-    sources = []
-    seen = set()
-    for c in chunks:
-        u = c["url"]
-        if u not in seen:
-            seen.add(u)
-            sources.append({"url": u, "title": c.get("title", "")})
-
-    return {
-        "answer": text,
-        "sources": sources,
-        "chunks_used": len(chunks),
-    }
+    cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text)
+                    if 1 <= int(n) <= len(chunks)})
+    sources, seen = [], set()
+    for n in cited:
+        c = chunks[n - 1]
+        if c["url"] not in seen:
+            seen.add(c["url"])
+            sources.append({"n": n, "url": c["url"], "title": c.get("title", "")})
+    return {"answer": text, "sources": sources, "chunks_used": len(chunks)}
 
 
+def rewrite_query(history, question):
+    """Turn a follow-up into a standalone search query."""
+    if not history:
+        return question
+    convo = "\n".join(f"{m['role']}: {m['content'][:300]}" for m in history[-4:])
+    resp = requests.post(OPENAI_API_URL,
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        json={"model": CHAT_MODEL, "temperature": 0, "max_tokens": 60,
+              "messages": [{"role": "user", "content":
+                f"Conversation:\n{convo}\n\nRewrite the last user question as a "
+                f"standalone search query. Output only the query.\n"
+                f"Question: {question}"}]},
+        timeout=30)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+  
 if __name__ == "__main__":
     sys.path.insert(0, BASE_DIR)
     from src import retriever as rmod
