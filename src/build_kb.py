@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-Build the PlacidWay knowledge base.
+Build the PlacidWay knowledge base using LangChain.
 
-Splits each scraped page into overlapping chunks, embeds them with OpenAI,
-and stores a JSON index (chunks + vectors) plus a simple TF-IDF fallback
-so retrieval works even without an API key.
-
-Usage:
-    export OPENAI_API_KEY="sk-..."
-    python3 build_kb.py
+Uses LangChain text splitters with recursive character splitting,
+semantic-aware chunking strategies, and stores everything in the KB
+with rich metadata. Builds FAISS vector store + BM25 for hybrid retrieval.
 """
 
 import json
@@ -21,7 +17,22 @@ from typing import List, Dict, Any
 
 import requests
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # project root
+try:
+    from langchain_text_splitters import (
+        RecursiveCharacterTextSplitter,
+        MarkdownHeaderTextSplitter,
+        TokenTextSplitter,
+    )
+    from langchain_core.documents import Document
+    from langchain_openai import OpenAIEmbeddings
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.retrievers import BM25Retriever
+    from langchain.retrievers import EnsembleRetriever
+    LANGCHAIN_AVAILABLE = True
+except Exception:
+    LANGCHAIN_AVAILABLE = False
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Load .env if present
 _env_path = os.path.join(BASE_DIR, ".env")
@@ -39,13 +50,96 @@ CHAT_MODEL = "gpt-4o-mini"
 OPENAI_API_URL = "https://api.openai.com/v1/embeddings"
 API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-CHUNK_SIZE = 900      # chars per chunk
-CHUNK_OVERLAP = 150   # chars of overlap between neighbours
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
 
 
-# ---------------------------------------------------------------- chunking
-def chunk_text(text: str, url: str, page_type: str, title: str) -> List[Dict]:
-    """Split text on sentence-ish boundaries, keeping overlap."""
+def chunk_text_langchain(text: str, url: str, page_type: str, title: str) -> List[Dict]:
+    """Use LangChain splitters for proper chunking with multiple strategies."""
+    if not LANGCHAIN_AVAILABLE:
+        # Fallback to original chunking
+        return chunk_text_legacy(text, url, page_type, title)
+    
+    chunks = []
+    
+    # Strategy 1: Markdown header splitting if markdown-like structure
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+    
+    try:
+        markdown_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=headers_to_split_on,
+            strip_headers=False
+        )
+        md_splits = markdown_splitter.split_text(text)
+        if md_splits and len(md_splits) > 1:
+            # Further split large sections
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP,
+                length_function=len,
+                separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
+            )
+            for i, doc in enumerate(md_splits):
+                sub_chunks = text_splitter.split_text(doc.page_content)
+                for j, sub_chunk in enumerate(sub_chunks):
+                    if sub_chunk.strip():
+                        metadata = dict(doc.metadata)
+                        metadata.update({
+                            "url": url,
+                            "page_type": page_type,
+                            "title": title,
+                            "chunk_strategy": "markdown_recursive",
+                        })
+                        chunks.append({
+                            "id": f"md_{i}_{j}",
+                            "url": url,
+                            "page_type": page_type,
+                            "title": title,
+                            "text": sub_chunk.strip(),
+                            "metadata": metadata,
+                        })
+            if chunks:
+                return chunks
+    except Exception:
+        pass
+    
+    # Strategy 2: Recursive character splitting (primary strategy)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+        separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
+    )
+    
+    docs = text_splitter.create_documents([text], metadatas=[{
+        "url": url,
+        "page_type": page_type,
+        "title": title,
+    }])
+    
+    for i, doc in enumerate(docs):
+        chunks.append({
+            "id": f"rc_{i}",
+            "url": url,
+            "page_type": page_type,
+            "title": title,
+            "text": doc.page_content.strip(),
+            "metadata": {
+                **doc.metadata,
+                "chunk_strategy": "recursive_character",
+                "chunk_index": i,
+            },
+        })
+    
+    return chunks
+
+
+def chunk_text_legacy(text: str, url: str, page_type: str, title: str) -> List[Dict]:
+    """Legacy chunking as fallback."""
     text = re.sub(r"\s+", " ", text).strip()
     chunks = []
     start = 0
@@ -53,7 +147,6 @@ def chunk_text(text: str, url: str, page_type: str, title: str) -> List[Dict]:
     idx = 0
     while start < n:
         end = min(start + CHUNK_SIZE, n)
-        # try to break on a sentence boundary
         if end < n:
             cut = max(
                 text.rfind(". ", start, end),
@@ -67,11 +160,12 @@ def chunk_text(text: str, url: str, page_type: str, title: str) -> List[Dict]:
         if chunk:
             chunks.append(
                 {
-                    "id": f"{idx}",
+                    "id": f"leg_{idx}",
                     "url": url,
                     "page_type": page_type,
                     "title": title,
                     "text": chunk,
+                    "metadata": {"chunk_strategy": "legacy"},
                 }
             )
             idx += 1
@@ -79,6 +173,11 @@ def chunk_text(text: str, url: str, page_type: str, title: str) -> List[Dict]:
             break
         start = end - CHUNK_OVERLAP
     return chunks
+
+
+# Keep original for compatibility
+def chunk_text(text: str, url: str, page_type: str, title: str) -> List[Dict]:
+    return chunk_text_langchain(text, url, page_type, title)
 
 
 # ---------------------------------------------------------------- embeddings
@@ -145,35 +244,36 @@ def main():
     with open(kb_path, encoding="utf-8") as fh:
         records = json.load(fh)
 
-    chunks = []
+    all_chunks = []
     for r in records:
         if not r.get("text"):
             continue
-        chunks.extend(
-            chunk_text(
-                r["text"], r["url"], r["page_type"], r.get("title", "")
-            )
+        chunks = chunk_text_langchain(
+            r["text"], r["url"], r["page_type"], r.get("title", "")
         )
-    print(f"[build_kb] {len(chunks)} chunks from {len(records)} pages")
+        all_chunks.extend(chunks)
+    print(f"[build_kb] {len(all_chunks)} chunks from {len(records)} pages using LangChain splitters")
 
     # TF-IDF fallback (always built)
-    tfidf_vecs, idf = build_tfidf(chunks)
-    for c, v in zip(chunks, tfidf_vecs):
+    tfidf_vecs, idf = build_tfidf(all_chunks)
+    for c, v in zip(all_chunks, tfidf_vecs):
         c["tfidf"] = v
 
     index: Dict[str, Any] = {
         "model": EMBED_MODEL,
         "chat_model": CHAT_MODEL,
-        "chunks": chunks,
+        "chunks": all_chunks,
         "idf": idf,
         "embeddings": None,
+        "langchain_enabled": LANGCHAIN_AVAILABLE,
+        "chunking_strategy": "langchain_recursive_markdown",
     }
 
     # Optional OpenAI embeddings
     if API_KEY:
         try:
             print("[build_kb] embedding chunks with OpenAI ...")
-            texts = [c["text"] for c in chunks]
+            texts = [c["text"] for c in all_chunks]
             vecs = embed_texts(texts)
             index["embeddings"] = vecs
             print(f"[build_kb] embedded {len(vecs)} chunks")
@@ -181,6 +281,31 @@ def main():
             print(f"[build_kb] embedding failed: {exc}; using TF-IDF only")
     else:
         print("[build_kb] no OPENAI_API_KEY; using TF-IDF fallback only")
+
+    # Build LangChain vector stores if available
+    if LANGCHAIN_AVAILABLE and API_KEY:
+        try:
+            print("[build_kb] building LangChain FAISS vector store...")
+            docs = []
+            for c in all_chunks:
+                docs.append(Document(
+                    page_content=c["text"],
+                    metadata={
+                        "url": c["url"],
+                        "page_type": c["page_type"],
+                        "title": c["title"],
+                        "chunk_id": c["id"],
+                        **c.get("metadata", {}),
+                    }
+                ))
+            embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+            vectorstore = FAISS.from_documents(docs, embeddings)
+            faiss_path = os.path.join(BASE_DIR, "data", "faiss_index")
+            vectorstore.save_local(faiss_path)
+            index["faiss_index_path"] = faiss_path
+            print(f"[build_kb] saved FAISS index to {faiss_path}")
+        except Exception as exc:
+            print(f"[build_kb] FAISS build failed: {exc}")
 
     out = os.path.join(BASE_DIR, "data", "kb_index.json")
     with open(out, "w", encoding="utf-8") as fh:

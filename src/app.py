@@ -55,9 +55,10 @@ app = FastAPI(title="PlacidWay Chatbot")
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
-# Simple in-memory conversation cache (bounded)
+# Simple in-memory conversation cache (bounded) with better memory
 _conv_cache: "OrderedDict[str, List]" = OrderedDict()
-_CACHE_MAX = 50
+_CACHE_MAX = 100  # Increased for better context retention
+
 
 @lru_cache(maxsize=1)
 def _load_retriever(mtime: float):
@@ -125,19 +126,18 @@ async def health():
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     question = req.question.strip()
-    top_k = max(1, min(req.top_k, 10))            # cap client input
-    history = _cache_get(req.session_id or "default")
+    session_id = req.session_id or "default"
+    top_k = 6
+    history = _cache_get(session_id)
 
+    # Rewrite query using last 2 turns of history
     search_q = llm_mod.rewrite_query(history, question)
     hits = get_retriever().search(search_q, top_k=top_k)
     chunks = [c for c, _ in hits]
-    if not chunks:
-        return JSONResponse({"answer": "I couldn't find this on our pages. "
-                             "Please contact PlacidWay for a free quote.",
-                             "sources": []})
-    result = llm_mod.answer(chunks, question)
+    
+    result = llm_mod.answer(chunks, question, history)
 
-    history = _cache_get(session_id)
+    # Update history
     history.append({"role": "user", "content": question})
     history.append({"role": "assistant", "content": result["answer"]})
     _cache_put(session_id, history)
@@ -146,7 +146,7 @@ def chat(req: ChatRequest):
         {
             "answer": result["answer"],
             "sources": result["sources"],
-            "chunks_used": result["chunks_used"],
+            "chunks_used": result.get("chunks_used", len(chunks)),
         }
     )
 
